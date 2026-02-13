@@ -1,0 +1,14 @@
+name = "Canonical-min"
+version = "0.1.0"
+defaultTargets = ["CanonicalMin"]
+testDriver = "Test"
+
+[[lean_lib]]
+name = "CanonicalMin"
+
+[[require]]
+name = "Canonical"
+scope = "chasenorman"
+
+[[lean_lib]]
+name = "Test"
