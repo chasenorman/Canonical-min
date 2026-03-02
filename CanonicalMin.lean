@@ -1,6 +1,6 @@
 import Canonical
 import CanonicalMin.Search
-open Lean Parser Tactic Meta Elab Tactic Core PremiseSelection
+open Lean Parser Meta Elab Tactic
 
 abbrev DfsM := StateT CanonicalState IO
 instance : MonadLiftT CanonicalM DfsM where
@@ -25,7 +25,14 @@ end
 partial def Canonical.Typ.toType (ty : Canonical.Typ) (ctx : List (Array String) := []) : CanonicalM TypeMVar := do
   let preferredNames := ty.lets.map (·.name) ++ ty.params.map (·.name)
   let types := ty.letTypes ++ ty.paramTypes
-  pure { inputs := ← types.mapM (·.get!.toType (if preferredNames.isEmpty then ctx else preferredNames :: ctx)), output := ← ty.toTerm.toTerm ctx, preferredNames }
+  return {
+    inputs := ← types.mapM fun x => (x.getD {
+      spine := { head := "_u", args := #[], premiseRules := #[] },
+      paramTypes := #[],
+      letTypes := #[]
+    }).toType (if preferredNames.isEmpty then ctx else preferredNames :: ctx),
+    output := ← ty.toTerm.toTerm ctx, preferredNames
+  }
 
 def disambiguate (str : String) (set : Std.HashSet String) : String := Id.run do
   let mut count := 0
@@ -66,19 +73,6 @@ partial def MVar.toString (s : MVar) : CanonicalM String := do
     let args := args.foldl (s!"{·} {·}") ""
     pure s!"(λ{params}. {name}{args})"
 
-def add (arr : Array Constraint) : CanonicalM Unit := do
-  for c in arr do modify fun x => { x with
-    constraints := x.constraints.modify c.stuck.id (·.push c)
-  }
-
-syntax premises := " [" withoutPosition(term,*,?) "]"
-
-partial def consistentWith (t1 t2 : Canonical.Term) : Bool :=
-  t1.spine.head == "_" || (
-    t1.spine.head == t2.spine.head &&
-    (t1.spine.args.zip t2.spine.args).all fun (arg1, arg2) => consistentWith arg1 arg2
-  )
-
 def removeTypeInType (typ : Canonical.Typ) : Canonical.Typ :=
   if let some idx := typ.lets.findIdx? (fun v => v.name == "Sort") then
     let uType : Canonical.Typ := ⟨⟨#[], #[], ⟨"_u", #[], #[]⟩, #[]⟩, #[], #[]⟩
@@ -87,112 +81,60 @@ def removeTypeInType (typ : Canonical.Typ) : Canonical.Typ :=
       letTypes := (typ.letTypes.set! idx uType).push uType }
   else typ
 
-partial def depth (t : Canonical.Term) : Nat :=
-  1 + t.spine.args.foldl (fun n t => max n (depth t)) 0
-
-def inhabit (typ : Canonical.Typ) (timeout : Nat) (count : Nat) : DfsM (Array Canonical.Term) := do
-  -- let desired := (← Canonical.canonical typ timeout.toUInt64 count.toUSize).terms[0]!
-
+def inhabit (typ : Canonical.Typ) (timeout : Nat) (count : Nat) : DfsM Canonical.CanonicalResult := do
   let result : IO.Ref (Array Canonical.Term) ← IO.mkRef #[]
-  let tsk ← typ.toType
-  let typ := Typ.mk tsk []
-  let size : Nat := (← get).constraints.size
-  let _ ← (do pure (← modify fun x =>
-    { x with
-      constraints := x.constraints.push #[]
-      assignments := x.assignments.push none
-    }
-  ) : CanonicalM Unit)
-  let sk := MVar.mk size [tsk] tsk.preferredNames
-  let tm := Term.mk sk []
+  let tmvar ← typ.toType
+  let typ := Typ.mk tmvar []
+  let mvar := MVar.mk (← capacity) [tmvar] tmvar.preferredNames
+  let tm := Term.mk mvar []
+  extend 1
   let time ← IO.monoMsNow
-  -- let steps ← IO.mkRef 0
+  let steps ← IO.mkRef 0
 
-  add (← run (do constraint (check tm typ) 0)).get!
+  process (·.push ·) (← run (do constraint (check tm typ) 0)).get!
   try
-    iddfs sk (do
-      let tm ← sk.toTerm
-      result.modify (·.push tm)
-      dbg_trace (depth tm)
-      if (← result.get).size >= count then
-        IO.throwServerError ""
+    iddfs mvar (do
+      result.modify (·.push { (← mvar.toTerm) with params := #[] })
+      if (← result.get).size >= count then IO.throwServerError ""
     ) (do
-      -- steps.modify (· + 1)
-      -- IO.println (← sk.toTerm).spine
+      steps.modify (· + 1)
       if (← IO.checkCanceled) || timeout*1000 <= (← IO.monoMsNow) - time then IO.throwServerError ""
-      -- pure (consistentWith (← sk.toTerm) desired)
     )
   catch _ => pure ()
-  -- dbg_trace ← steps.get
-  dbg_trace ((← IO.monoMsNow) - time).toFloat / 1000.0
-  result.get
+  return { terms := ← result.get
+           attempted_resolutions := 0
+           successful_resolutions := 0
+           steps := ← steps.get
+           last_level_steps := 0
+           branching := 0 }
 
 def preprocessIntros (goal : MVarId) (reconstruct : Expr → MetaM Expr) : MetaM (MVarId × (Expr → MetaM Expr)) := do
-  let goal := (← mkFreshExprMVar (← goal.getType)).mvarId!
-  let (fvars, mvar) ← goal.intros
-  let reconstruct' := fun e : Expr => do
-    reconstruct (← mkLambdaFVars (fvars.map (.fvar)) e)
-  return (mvar, reconstruct')
+  goal.withContext do
+    let goal := (← mkFreshExprMVar (← goal.getType)).mvarId!
+    let (fvars, mvar) ← goal.intros
+    let reconstruct' := fun e : Expr => do
+      reconstruct (← mkLambdaFVars (fvars.map (.fvar)) e)
+    return (mvar, reconstruct')
 
-def preprocessCanonical (goal : MVarId) (premises : Array Name) (config : Canonical.CanonicalConfig) : MetaM (Canonical.Typ × MVarId × (Expr → MetaM Expr)) := do
-  let mut premises := premises
-  if config.suggestions then
-    let found ← select goal
-    let found := found.insertionSort (fun a b => a.score > b.score)
-    let found := found.map (fun x => x.name)
-    let found := found.take 3
-    premises := premises ++ found
-
-  let mut structs := #[]
-  if config.destruct then
-    let env ← getEnv
-    structs := premises.filter fun name => isStructure env name
-    premises := premises.filter fun name => !isStructure env name
-
-  if config.pi then
-    premises := premises.push ``Canonical.Pi
+elab (name := canonicalSeq) "canonical_min" timeout_syntax:(num)? config:optConfig premises_syntax:(Canonical.premises)? : tactic => unsafe do
+  let config ← Canonical.canonicalConfig config
+  let goal ← getMainGoal
+  let (premises, structs) ← Canonical.getPremises goal premises_syntax config
 
   let (goal', reconstruct) ← Canonical.preprocess goal config structs
   let (goal', reconstruct) ← preprocessIntros goal' reconstruct
 
   let typ ← Canonical.withArityUnfold config.monomorphize do goal'.withContext do
-    let goal ← goal'.getType
-    Canonical.toCanonical goal premises (structs.push ``Canonical.Pi) config
+    Canonical.toCanonical (← goal'.getType) premises (structs.push ``Canonical.Pi) config
+  let typ := removeTypeInType typ
 
-  return (removeTypeInType typ, goal', reconstruct)
-
-elab (name := canonicalSeq) "canonical_min" timeout_syntax:(num)? config:optConfig premises_syntax:(premises)? : tactic => unsafe do
-  let mut premises ← if let some premises := premises_syntax then
-    match premises with
-    | `(premises| [$args,*]) => args.getElems.raw.mapM resolveGlobalConstNoOverload
-    | _ => Elab.throwUnsupportedSyntax
-    else pure #[]
+  if config.debug then
+    Elab.admitGoal goal
+    dbg_trace typ
+    return
 
   let timeout := if let some timeout := timeout_syntax then timeout.getNat else 5
+  let (result, _) ← inhabit typ timeout config.count.toNat {}
 
-  let config ← Canonical.canonicalConfig config
-
-  let (typ, goal', reconstruct) ← preprocessCanonical (← getMainGoal) premises config
-
-  let (proofs, _) ← inhabit typ timeout config.count.toNat {}
-
-  Canonical.withArityUnfold config.monomorphize do goal'.withContext do
-    let proofs ← proofs.mapM fun term =>
-      let term := { term with params := #[] }
-      do Canonical.fromCanonical term (← goal'.getType)
-    let proofs ← proofs.mapM (fun x => reconstruct x)
-
-    if proofs.isEmpty then
-      match premises_syntax with
-      | some _ => match timeout_syntax with
-        | some _ => throwError "No proof found."
-        | none => throwError "No proof found. Change timeout to `n` with `canonical n`"
-      | none => throwError "No proof found. Supply constant symbols with `canonical [name, ...]`"
-
-    (← getMainGoal).withContext do
-      withOptions Canonical.applyOptions do
-        Elab.admitGoal (← getMainGoal)
-        if h : proofs.size = 1 then
-          Meta.Tactic.TryThis.addExactSuggestion (← getRef) proofs[0]
-        else
-          Meta.Tactic.TryThis.addExactSuggestions (← getRef) proofs
+  let proofs ← Canonical.postprocess result goal' config reconstruct
+  Canonical.present proofs goal premises_syntax timeout_syntax

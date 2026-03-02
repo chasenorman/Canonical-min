@@ -21,15 +21,16 @@ def process (f : Array Constraint → Constraint → Array Constraint)
     constraints := state.constraints.modify c.stuck.id (f · c)
   }
 
-def MVar.domain (m : MVar) (pos : Nat) := do
-  let mut result : Array (Assignment × Array Constraint) := #[]
+def MVar.domain (m : MVar) (pos : Nat) :
+  CanonicalM (Array (Assignment × Array Constraint)) := do
+  let mut result := #[]
   for (blockType, debruijn) in m.lctx.zipIdx do
     for (headType, index) in blockType.inputs.zipIdx do
       if pos + headType.inputs.size > (← capacity) then continue
-      let args := headType.inputs.zipIdx.map fun (input, k) => ({
+      let args := headType.inputs.zipIdx.map fun (input, k) => {
         id := pos + k, lctx := if (inputs input).isEmpty then m.lctx else input :: m.lctx,
         preferredNames := input.preferredNames
-      } : MVar)
+      }
       let assn : Assignment := { debruijn, index, args }
       m.assign assn
       if let some constraints ← run
