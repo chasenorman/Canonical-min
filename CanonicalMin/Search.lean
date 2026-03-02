@@ -131,7 +131,7 @@ metavariable identifiers, we keep track of the first unused identifier, `pos`.
 -/
 partial def dfs [MonadLiftT CanonicalM m]
   (entropy : Float) (pos : Nat) : m Unit := do
-  step
+  step -- user-provided function for logging, cancelling, etc.
   let (some (mvar, _), predicted) ← next root | cb
   if entropy < predicted then return
   let domain ← mvar.domain pos
@@ -140,7 +140,7 @@ partial def dfs [MonadLiftT CanonicalM m]
     process (·.push ·) constraints
     dfs (entropy / domain.size.toFloat) (pos + assn.args.size)
     process (fun _ => ·.pop) constraints
-  mvar.assign none
+  mvar.assign none -- unassign mvar
 
 /--
 The `extend` function appends `none` values to `assignment` and empty arrays to
